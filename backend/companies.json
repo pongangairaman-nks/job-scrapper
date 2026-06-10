@@ -1,0 +1,7 @@
+[
+  { "name": "Stripe",  "url": "https://stripe.com"  },
+  { "name": "Notion",  "url": "https://notion.so"   },
+  { "name": "Linear",  "url": "https://linear.app"  },
+  { "name": "Vercel",  "url": "https://vercel.com"  },
+  { "name": "Figma",   "url": "https://figma.com"   }
+]
