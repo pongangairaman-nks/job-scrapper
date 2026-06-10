@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import CompanyList from './components/CompanyList'
 import Controls from './components/Controls'
 import JobsTable from './components/JobsTable'
+import PreferencesPanel from './components/PreferencesPanel'
 import StatusLog from './components/StatusLog'
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:8000'
@@ -15,12 +16,24 @@ const EMPTY_STATUS = {
   log: [],
 }
 
+const DEFAULT_PREFS = {
+  roles: [],
+  locations: [],
+  experience: [],
+  work_type: [],
+  work_mode: [],
+  salary_min: null,
+  salary_max: null,
+}
+
 export default function App() {
   const [companies, setCompanies] = useState([])
   const [jobs, setJobs] = useState([])
   const [status, setStatus] = useState(EMPTY_STATUS)
+  const [preferences, setPreferences] = useState(DEFAULT_PREFS)
   const [isScraping, setIsScraping] = useState(false)
   const [isSendingEmail, setIsSendingEmail] = useState(false)
+  const [isSavingPrefs, setIsSavingPrefs] = useState(false)
   const [toast, setToast] = useState(null)
   const [isDark, setIsDark] = useState(() => {
     const saved = localStorage.getItem('theme')
@@ -56,10 +69,18 @@ export default function App() {
     } catch (_) {}
   }, [])
 
+  const fetchPreferences = useCallback(async () => {
+    try {
+      const r = await fetch(`${API}/preferences`)
+      if (r.ok) setPreferences(await r.json())
+    } catch (_) {}
+  }, [])
+
   useEffect(() => {
     fetchCompanies()
     fetchJobs()
     fetchStatus()
+    fetchPreferences()
   }, [])
 
   // Poll /status every 2s while scraping
@@ -106,6 +127,25 @@ export default function App() {
     }
   }
 
+  const handleSavePreferences = async (prefs) => {
+    setIsSavingPrefs(true)
+    try {
+      const r = await fetch(`${API}/preferences`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(prefs),
+      })
+      const data = await r.json()
+      if (!r.ok) throw new Error(data.detail || 'Save failed')
+      setPreferences(data)
+      showToast('Preferences saved')
+    } catch (err) {
+      showToast(err.message, 'error')
+    } finally {
+      setIsSavingPrefs(false)
+    }
+  }
+
   const handleAddCompany = async (name, url) => {
     const r = await fetch(`${API}/companies`, {
       method: 'POST',
@@ -126,19 +166,13 @@ export default function App() {
     if (r.ok) await Promise.all([fetchCompanies(), fetchStatus()])
   }
 
-  const showLog = isScraping || status.log?.length > 0
-
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-100 transition-colors duration-200">
       {/* Toast */}
       {toast && (
-        <div
-          className={`fixed top-4 right-4 z-50 px-4 py-3 rounded-xl shadow-xl text-sm font-semibold max-w-sm transition-all ${
-            toast.type === 'error'
-              ? 'bg-red-500 text-white'
-              : 'bg-emerald-500 text-white'
-          }`}
-        >
+        <div className={`fixed top-4 right-4 z-50 px-4 py-3 rounded-xl shadow-xl text-sm font-semibold max-w-sm ${
+          toast.type === 'error' ? 'bg-red-500 text-white' : 'bg-emerald-500 text-white'
+        }`}>
           {toast.msg}
         </div>
       )}
@@ -174,7 +208,13 @@ export default function App() {
           isSendingEmail={isSendingEmail}
         />
 
-        {showLog && (
+        <PreferencesPanel
+          preferences={preferences}
+          onSave={handleSavePreferences}
+          isSaving={isSavingPrefs}
+        />
+
+        {(isScraping || status.log?.length > 0) && (
           <StatusLog log={status.log ?? []} isActive={isScraping} />
         )}
 

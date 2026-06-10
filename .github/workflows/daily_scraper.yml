@@ -27,3 +27,11 @@ jobs:
           GMAIL_SENDER: ${{ secrets.GMAIL_SENDER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
         run: python backend/main.py --headless
+
+      # Optional: also trigger the live API so the dashboard stays updated
+      - name: Ping live API scrape endpoint
+        if: ${{ vars.BACKEND_URL != '' }}
+        run: |
+          curl -s -X POST "${{ vars.BACKEND_URL }}/scrape" \
+            -H "Content-Type: application/json" \
+            --max-time 120 || true

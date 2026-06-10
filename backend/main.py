@@ -6,24 +6,25 @@ import os
 import sys
 from contextlib import asynccontextmanager
 from datetime import datetime
+from typing import List, Optional
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 load_dotenv()
 
 from database import Base, SessionLocal, engine, get_db
 from email_sender import send_email
-from models import Company, Job
+from models import Company, Job, Preferences, DEFAULT_ROLES
 from scraper import run_scraper
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# In-memory state for live scraper status
 scraper_state: dict = {
     "is_scraping": False,
     "last_run": None,
@@ -32,26 +33,69 @@ scraper_state: dict = {
 }
 
 
+# ---------- DB helpers ----------
+
+def _migrate_db() -> None:
+    """Add new columns to existing tables without dropping data."""
+    new_cols = [
+        "ALTER TABLE jobs ADD COLUMN location TEXT DEFAULT ''",
+        "ALTER TABLE jobs ADD COLUMN work_mode TEXT DEFAULT ''",
+        "ALTER TABLE jobs ADD COLUMN work_type TEXT DEFAULT ''",
+        "ALTER TABLE jobs ADD COLUMN experience TEXT DEFAULT ''",
+    ]
+    with engine.connect() as conn:
+        for sql in new_cols:
+            try:
+                conn.execute(text(sql))
+                conn.commit()
+            except Exception:
+                pass  # column already exists
+
+
 def _seed_companies(db: Session) -> None:
     if db.query(Company).count() > 0:
         return
-    companies_file = os.path.join(os.path.dirname(__file__), "companies.json")
-    if not os.path.exists(companies_file):
+    path = os.path.join(os.path.dirname(__file__), "companies.json")
+    if not os.path.exists(path):
         return
-    with open(companies_file) as f:
+    with open(path) as f:
         companies = json.load(f)
     for c in companies:
         db.add(Company(name=c["name"], url=c["url"]))
     db.commit()
-    logger.info("Seeded %d companies from companies.json", len(companies))
+    logger.info("Seeded %d companies", len(companies))
+
+
+def _seed_preferences(db: Session) -> None:
+    if db.query(Preferences).count() == 0:
+        db.add(Preferences(roles=list(DEFAULT_ROLES)))
+        db.commit()
+
+
+def _get_prefs(db: Session) -> dict:
+    prefs = db.query(Preferences).first()
+    if not prefs:
+        return {"roles": list(DEFAULT_ROLES), "locations": [], "experience": [],
+                "work_type": [], "work_mode": [], "salary_min": None, "salary_max": None}
+    return {
+        "roles": prefs.roles or [],
+        "locations": prefs.locations or [],
+        "experience": prefs.experience or [],
+        "work_type": prefs.work_type or [],
+        "work_mode": prefs.work_mode or [],
+        "salary_min": prefs.salary_min,
+        "salary_max": prefs.salary_max,
+    }
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    _migrate_db()
     db = SessionLocal()
     try:
         _seed_companies(db)
+        _seed_preferences(db)
     finally:
         db.close()
     yield
@@ -74,7 +118,17 @@ class CompanyCreate(BaseModel):
     url: str
 
 
-# ---------- Endpoints ----------
+class PreferencesUpdate(BaseModel):
+    roles: List[str] = []
+    locations: List[str] = []
+    experience: List[str] = []
+    work_type: List[str] = []
+    work_mode: List[str] = []
+    salary_min: Optional[int] = None
+    salary_max: Optional[int] = None
+
+
+# ---------- Companies ----------
 
 @app.get("/companies")
 def list_companies(db: Session = Depends(get_db)):
@@ -100,6 +154,34 @@ def delete_company(company_id: int, db: Session = Depends(get_db)):
     return {"ok": True}
 
 
+# ---------- Preferences ----------
+
+@app.get("/preferences")
+def get_preferences(db: Session = Depends(get_db)):
+    return _get_prefs(db)
+
+
+@app.put("/preferences")
+def update_preferences(payload: PreferencesUpdate, db: Session = Depends(get_db)):
+    prefs = db.query(Preferences).first()
+    if not prefs:
+        prefs = Preferences()
+        db.add(prefs)
+
+    prefs.roles = payload.roles
+    prefs.locations = payload.locations
+    prefs.experience = payload.experience
+    prefs.work_type = payload.work_type
+    prefs.work_mode = payload.work_mode
+    prefs.salary_min = payload.salary_min
+    prefs.salary_max = payload.salary_max
+    prefs.updated_at = datetime.utcnow()
+    db.commit()
+    return _get_prefs(db)
+
+
+# ---------- Scrape ----------
+
 @app.post("/scrape")
 async def trigger_scrape(db: Session = Depends(get_db)):
     if scraper_state["is_scraping"]:
@@ -109,6 +191,10 @@ async def trigger_scrape(db: Session = Depends(get_db)):
     if not companies:
         return {"jobs": [], "count": 0, "message": "No companies configured"}
 
+    prefs = _get_prefs(db)
+    if not prefs.get("roles"):
+        raise HTTPException(status_code=400, detail="No role keywords configured in preferences")
+
     scraper_state["is_scraping"] = True
     scraper_state["log"] = []
     scraper_state["jobs_found_this_run"] = 0
@@ -117,33 +203,31 @@ async def trigger_scrape(db: Session = Depends(get_db)):
         scraper_state["log"].append({"time": datetime.utcnow().isoformat(), "message": msg})
 
     try:
-        raw_jobs = await run_scraper(companies, log)
+        raw_jobs = await run_scraper(companies, prefs, log)
 
         new_jobs = []
-        for job_data in raw_jobs:
-            exists = (
-                db.query(Job)
-                .filter(
-                    Job.company_id == job_data["company_id"],
-                    Job.title == job_data["title"],
-                )
-                .first()
-            )
+        for jd in raw_jobs:
+            exists = db.query(Job).filter(
+                Job.company_id == jd["company_id"],
+                Job.title == jd["title"],
+            ).first()
             if not exists:
-                job = Job(
-                    company_id=job_data["company_id"],
-                    title=job_data["title"],
-                    url=job_data.get("url", ""),
-                    source=job_data.get("source", "unknown"),
-                )
-                db.add(job)
-                new_jobs.append(job_data)
+                db.add(Job(
+                    company_id=jd["company_id"],
+                    title=jd["title"],
+                    url=jd.get("url", ""),
+                    source=jd.get("source", "unknown"),
+                    location=jd.get("location", ""),
+                    work_mode=jd.get("work_mode", ""),
+                    work_type=jd.get("work_type", ""),
+                    experience=jd.get("experience", ""),
+                ))
+                new_jobs.append(jd)
 
         db.commit()
         scraper_state["last_run"] = datetime.utcnow().isoformat()
         scraper_state["jobs_found_this_run"] = len(new_jobs)
         log(f"✅ Done! {len(new_jobs)} new job(s) saved.")
-
         return {"jobs": new_jobs, "count": len(new_jobs)}
 
     except Exception as exc:
@@ -152,6 +236,8 @@ async def trigger_scrape(db: Session = Depends(get_db)):
     finally:
         scraper_state["is_scraping"] = False
 
+
+# ---------- Jobs ----------
 
 @app.get("/jobs")
 def list_jobs(db: Session = Depends(get_db)):
@@ -164,12 +250,18 @@ def list_jobs(db: Session = Depends(get_db)):
             "title": j.title,
             "url": j.url,
             "source": j.source,
+            "location": j.location or "",
+            "work_mode": j.work_mode or "",
+            "work_type": j.work_type or "",
+            "experience": j.experience or "",
             "found_at": j.found_at.isoformat() if j.found_at else None,
             "emailed": j.emailed,
         }
         for j in jobs
     ]
 
+
+# ---------- Email ----------
 
 @app.post("/send-email")
 def send_email_digest(db: Session = Depends(get_db)):
@@ -183,10 +275,12 @@ def send_email_digest(db: Session = Depends(get_db)):
             "url": j.url,
             "source": j.source,
             "company_name": j.company.name,
+            "location": j.location or "",
+            "work_mode": j.work_mode or "",
+            "work_type": j.work_type or "",
         }
         for j in jobs
     ]
-
     try:
         send_email(jobs_data)
     except Exception as exc:
@@ -195,9 +289,10 @@ def send_email_digest(db: Session = Depends(get_db)):
     for j in jobs:
         j.emailed = True
     db.commit()
-
     return {"message": f"Email sent with {len(jobs)} job(s)"}
 
+
+# ---------- Status ----------
 
 @app.get("/status")
 def get_status(db: Session = Depends(get_db)):
@@ -211,44 +306,45 @@ def get_status(db: Session = Depends(get_db)):
     }
 
 
-# ---------- Headless mode (GitHub Actions) ----------
+# ---------- Headless mode ----------
 
 async def _headless_run() -> None:
     print("🤖 Job Scraper — headless mode")
     Base.metadata.create_all(bind=engine)
+    _migrate_db()
     db = SessionLocal()
-
     try:
         _seed_companies(db)
+        _seed_preferences(db)
         companies = db.query(Company).all()
-
         if not companies:
             print("No companies configured. Exiting.")
             return
 
+        prefs = _get_prefs(db)
+        print(f"Roles: {prefs['roles']}")
         print(f"Scraping {len(companies)} companies...")
 
-        raw_jobs = await run_scraper(companies, log_callback=print)
+        raw_jobs = await run_scraper(companies, prefs, log_callback=print)
 
         new_jobs = []
-        for job_data in raw_jobs:
-            exists = (
-                db.query(Job)
-                .filter(
-                    Job.company_id == job_data["company_id"],
-                    Job.title == job_data["title"],
-                )
-                .first()
-            )
+        for jd in raw_jobs:
+            exists = db.query(Job).filter(
+                Job.company_id == jd["company_id"],
+                Job.title == jd["title"],
+            ).first()
             if not exists:
-                job = Job(
-                    company_id=job_data["company_id"],
-                    title=job_data["title"],
-                    url=job_data.get("url", ""),
-                    source=job_data.get("source", "unknown"),
-                )
-                db.add(job)
-                new_jobs.append(job_data)
+                db.add(Job(
+                    company_id=jd["company_id"],
+                    title=jd["title"],
+                    url=jd.get("url", ""),
+                    source=jd.get("source", "unknown"),
+                    location=jd.get("location", ""),
+                    work_mode=jd.get("work_mode", ""),
+                    work_type=jd.get("work_type", ""),
+                    experience=jd.get("experience", ""),
+                ))
+                new_jobs.append(jd)
 
         db.commit()
         print(f"✅ {len(new_jobs)} new job(s) saved.")
@@ -270,12 +366,9 @@ async def _headless_run() -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Job Scraper")
-    parser.add_argument(
-        "--headless",
-        action="store_true",
-        help="Run scrape + email then exit (used by GitHub Actions)",
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--headless", action="store_true",
+                        help="Run scrape + email then exit (GitHub Actions)")
     args = parser.parse_args()
 
     if args.headless:
